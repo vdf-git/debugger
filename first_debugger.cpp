@@ -65,6 +65,18 @@ const array<reg_descriptor, n_regs> g_register_descriptors {{
     {reg::gs, 55, "gs"},
 }};
 
+vector<string> split(const string &s, char delim) {
+    vector<string> out{};
+    stringstream ss{s};
+    string item;
+
+    while (getline(ss, item, delim)) {
+        out.push_back(item);
+    }
+
+    return out;
+}
+
 uint64_t get_register_value (pid_t pid, reg r) {
     user_regs_struct regs;
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
@@ -102,6 +114,12 @@ reg get_register_from_name(const string &name) {
     return it->r;
 }
 
+bool is_prefix(const string& prefix, const string& input) {
+  if (prefix.size() > input.size()) return false;
+  return equal(prefix.begin(), prefix.end(), input.begin());
+}
+
+
 class breakpoint {
 public:
     breakpoint(pid_t pid, intptr_t addr)
@@ -110,16 +128,22 @@ public:
     breakpoint() {}
         
     void enable() {
-      auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
-      m_saved_data = static_cast<uint8_t>(data & 0xff);
-      uint64_t int3 = 0xcc;
-      uint64_t data_with_int3 = ((data & ~0xff) | int3);
-      ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
+        auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
+        m_saved_data = static_cast<uint8_t>(data & 0xff);
+        uint64_t int3 = 0xcc;
+        uint64_t data_with_int3 = ((data & ~0xff) | int3);
+        ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
 
-      m_enabled = true;
+        m_enabled = true;
     }
 
-    void disable();
+    void disable() {
+        auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
+        auto restored_data = ((data & ~0xff) | m_saved_data);
+        ptrace(PTRACE_POKEDATA, m_pid, m_addr, restored_data);
+
+        m_enabled = false;
+    }
 
     auto is_enabled() const -> bool { return m_enabled;}
     auto get_address() const -> intptr_t{return m_addr;}
@@ -132,159 +156,113 @@ private:
 };
 
 
-void breakpoint::disable() {
-  auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
-  auto restored_data = ((data & ~0xff) | m_saved_data);
-  ptrace(PTRACE_POKEDATA, m_pid, m_addr, restored_data);
-
-  m_enabled = false;
-}
-
-bool is_prefix(const string& prefix, const string& input) {
-  if (prefix.size() > input.size()) return false;
-  return equal(prefix.begin(), prefix.end(), input.begin());
-}
-
 class debugger {
 public:
-  debugger (string prog_name, pid_t pid)
-    : m_prog_name{move(prog_name)}, m_pid(pid) {}
+    debugger (string prog_name, pid_t pid)
+        : m_prog_name{move(prog_name)}, m_pid(pid) {}
       
-  void run();
-  void continue_execution();
-  void set_breakpoint_at_address(intptr_t addr);
-  void handle_command(const string&);
-  void dump_registers();
-  uint64_t read_memory(uint64_t);
-  void write_memory(uint64_t, uint64_t);
-  uint64_t get_pc();
-  void set_pc(uint64_t);
-  void step_over_breakpoint();
-  void wait_for_signal();
+    void run() {
+        int wait_status;
+        int options = 0;
+        waitpid(m_pid, &wait_status, options);
+
+        char *line = NULL;
+        while ((line = linenoise("my_dbg> ")) != NULL) {
+            if (strcmp(line, "")) {
+                handle_command(line);
+                linenoiseHistoryAdd(line);
+                linenoiseFree(line);
+            }
+        }
+    }
+    void continue_execution() {
+        step_over_breakpoint();
+        ptrace(PTRACE_CONT, m_pid, NULL, NULL);
+        wait_for_signal();
+    }
+    void set_breakpoint_at_address(intptr_t addr) {
+        cout << "set breakpoint at 0x" << hex << addr << endl;
+        breakpoint bp {m_pid, addr};
+        bp.enable();
+        m_breakpoints[addr] = bp;
+    }
+    void dump_registers() {
+        for (const auto& rd : g_register_descriptors) {
+            cout << rd.name << " 0x" << setfill('0') << setw(16) << hex << get_register_value(m_pid, rd.r) << endl;
+        }
+    }
+    uint64_t read_memory(uint64_t address) {
+        return ptrace(PTRACE_PEEKDATA, m_pid, address, NULL);
+    }
+    void write_memory(uint64_t address, uint64_t value) {
+        ptrace(PTRACE_POKEDATA, m_pid, address, value);
+    }
+
+    uint64_t get_pc() {
+        return get_register_value(m_pid, reg::rip);
+    }
+    void set_pc(uint64_t pc) {
+        set_register_value(m_pid, reg::rip, pc);
+    }
+    void step_over_breakpoint() {
+        auto possible_breakpoint_location = get_pc() -1;
+
+        if (m_breakpoints.count(possible_breakpoint_location)) {
+            auto &bp = m_breakpoints[possible_breakpoint_location];
+
+            if (bp.is_enabled()) {
+                auto previous_instruction_address = possible_breakpoint_location;
+                set_pc(previous_instruction_address);
+
+                bp.disable();
+                ptrace(PTRACE_SINGLESTEP, m_pid, NULL, NULL);
+                wait_for_signal();
+                bp.enable();
+            }
+        }
+    }
+    void wait_for_signal() {
+        int wait_status;
+        auto options = 0;
+        waitpid(m_pid, &wait_status, options);
+    }
+    void handle_command(const string& line) {
+        vector<string> args = split (line, ' ');
+        string command = args[0];
+
+        if (is_prefix (command, "continue")) {
+            continue_execution();
+        } else if (is_prefix (command, "break")) {
+            string addr (args[1], 2);
+            set_breakpoint_at_address(stol(addr, 0 , 16)); 
+        } else if (is_prefix (command, "register") && (args[1] != "")) {
+            if (is_prefix (args[1], "dump")) {
+                dump_registers();
+            } else if (is_prefix(args[1], "read")) {
+                cout << get_register_value(m_pid, get_register_from_name(args[2])) << endl;
+            } else if (is_prefix(args[1], "write")) {
+                string val (args[3], 2);
+                set_register_value(m_pid, get_register_from_name(args[2]), stol(val, 0, 16));
+            }
+        } else if (is_prefix(command, "memory") && (args[1] == "")) {
+            string addr {args[2], 2};
+            if (is_prefix (args[1], "read")) {
+                cout << hex << read_memory(stol(addr, 0, 16)) << endl;
+            } else if (is_prefix(args[1], "write")) {
+                string val {args[3], 2};
+                write_memory(stol(addr, 0, 16), stol(val, 0, 16));
+            }
+        } else {
+            printf("Unknown command\n");
+        }
+    }
 
 private:
-  string m_prog_name;
-  pid_t m_pid;
-  unordered_map<intptr_t,breakpoint> m_breakpoints;
+    string m_prog_name;
+    pid_t m_pid;
+    unordered_map<intptr_t,breakpoint> m_breakpoints;
 };
 
-void debugger::set_breakpoint_at_address(intptr_t addr) {
-    cout << "set breakpoint at 0x" << hex << addr << endl;
-    breakpoint bp {m_pid, addr};
-    bp.enable();
-    m_breakpoints[addr] = bp;
-}
-
-void debugger::continue_execution() {
-    step_over_breakpoint();
-    ptrace(PTRACE_CONT, m_pid, NULL, NULL);
-    wait_for_signal();
-}
-
-vector<string> split(const string &s, char delim) {
-  vector<string> out{};
-  stringstream ss{s};
-  string item;
-
-  while (getline(ss, item, delim)) {
-    out.push_back(item);
-  }
-
-  return out;
-}
-
-void debugger::dump_registers() {
-    for (const auto& rd : g_register_descriptors) {
-        cout << rd.name << " 0x" << setfill('0') << setw(16) << hex << get_register_value(m_pid, rd.r) << endl;
-    }
-}
-
-uint64_t debugger::get_pc() {
-    return get_register_value(m_pid, reg::rip);
-}
-
-void debugger::set_pc(uint64_t pc) {
-    set_register_value(m_pid, reg::rip, pc);
-}
-
-void debugger::wait_for_signal() {
-    int wait_status;
-    auto options = 0;
-    waitpid(m_pid, &wait_status, options);
-}
-
-void debugger::step_over_breakpoint() {
-    auto possible_breakpoint_location = get_pc() -1;
-    
-    if (m_breakpoints.count(possible_breakpoint_location)) {
-        auto &bp = m_breakpoints[possible_breakpoint_location];
-        
-        if (bp.is_enabled()) {
-            auto previous_instruction_address = possible_breakpoint_location;
-            set_pc(previous_instruction_address);
-            
-            bp.disable();
-            ptrace(PTRACE_SINGLESTEP, m_pid, NULL, NULL);
-            wait_for_signal();
-            bp.enable();
-        }
-    }
-}
-
-uint64_t debugger::read_memory(uint64_t address) {
-    return ptrace(PTRACE_PEEKDATA, m_pid, address, NULL);
-}
-
-void debugger::write_memory(uint64_t address, uint64_t value) {
-    ptrace(PTRACE_POKEDATA, m_pid, address, value);
-}
-
-void debugger::handle_command(const string& line) {
-
-    vector<string> args = split (line, ' ');
-    string command = args[0];
-
-    if (is_prefix (command, "continue")) {
-        continue_execution();
-    } else if (is_prefix (command, "break")) {
-        string addr (args[1], 2);
-        set_breakpoint_at_address(stol(addr, 0 , 16)); 
-    } else if (is_prefix (command, "register") && (args[1] != "")) {
-        if (is_prefix (args[1], "dump")) {
-            dump_registers();
-        } else if (is_prefix(args[1], "read")) {
-            cout << get_register_value(m_pid, get_register_from_name(args[2])) << endl;
-        } else if (is_prefix(args[1], "write")) {
-            string val (args[3], 2);
-            set_register_value(m_pid, get_register_from_name(args[2]), stol(val, 0, 16));
-        }
-    } else if (is_prefix(command, "memory") && (args[1] == "")) {
-        string addr {args[2], 2};
-        if (is_prefix (args[1], "read")) {
-            cout << hex << read_memory(stol(addr, 0, 16)) << endl;
-        } else if (is_prefix(args[1], "write")) {
-            string val {args[3], 2};
-            write_memory(stol(addr, 0, 16), stol(val, 0, 16));
-        }
-    } else {
-        printf("Unknown command\n");
-    }
-}
-
-void debugger::run() {
-    int wait_status;
-    int options = 0;
-    waitpid(m_pid, &wait_status, options);
-
-    char *line = NULL;
-    while ((line = linenoise("my_dbg> ")) != NULL) {
-        if (strcmp(line, "")) {
-            handle_command(line);
-            linenoiseHistoryAdd(line);
-            linenoiseFree(line);
-        }
-    }
-}
 
 int main(int argc, char *argv[]) {
     breakpoint bp {5, 321};
