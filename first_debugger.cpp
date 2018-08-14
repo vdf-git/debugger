@@ -14,6 +14,8 @@
 #include <sys/user.h>
 #include <algorithm>
 #include <iomanip>
+#include "libelfin/elf/elf++.hh"
+#include "libelfin/dwarf/dwarf++.hh"
 
 using namespace std;
 
