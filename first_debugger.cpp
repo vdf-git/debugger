@@ -109,7 +109,16 @@ public:
     {}
     breakpoint() {}
         
-    void enable();
+    void enable() {
+      auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
+      m_saved_data = static_cast<uint8_t>(data & 0xff);
+      uint64_t int3 = 0xcc;
+      uint64_t data_with_int3 = ((data & ~0xff) | int3);
+      ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
+
+      m_enabled = true;
+    }
+
     void disable();
 
     auto is_enabled() const -> bool { return m_enabled;}
@@ -122,15 +131,6 @@ private:
     uint8_t m_saved_data;
 };
 
-void breakpoint::enable() {
-  auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
-  m_saved_data = static_cast<uint8_t>(data & 0xff);
-  uint64_t int3 = 0xcc;
-  uint64_t data_with_int3 = ((data & ~0xff) | int3);
-  ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
-
-  m_enabled = true;
-}
 
 void breakpoint::disable() {
   auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
