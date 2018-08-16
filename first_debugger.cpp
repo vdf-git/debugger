@@ -18,6 +18,7 @@
 #include <iomanip>
 #include "libelfin/elf/elf++.hh"
 #include "libelfin/dwarf/dwarf++.hh"
+#include <errno.h>
 
 using namespace std;
 
@@ -133,7 +134,12 @@ public:
         
     void enable() {
         auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, NULL);
+        if (data == -1) {
+            auto err = errno;
+            cout << "there was an error: " << errno << " pid " << m_pid << " addr " << m_addr << endl;
+        }
         m_saved_data = static_cast<uint8_t>(data & 0xff);
+	printf("bp data: %d\n", m_saved_data);
         uint64_t int3 = 0xcc;
         uint64_t data_with_int3 = ((data & ~0xff) | int3);
         ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
@@ -339,6 +345,8 @@ public:
 
         if (is_prefix (command, "continue")) {
             continue_execution();
+        } else if (is_prefix (command, "test")) {
+            print_source(m_prog_name, stol(args[1], 0, 10) , 1);
         } else if (is_prefix (command, "break")) {
             string addr (args[1], 2);
             set_breakpoint_at_address(stol(addr, 0 , 16)); 
@@ -375,18 +383,18 @@ private:
 
 int main(int argc, char *argv[]) {
     breakpoint bp {5, 321};
-  if (argc <2) {
-    printf("Program not specified\n");
-    exit(1);
-  }
+    if (argc <2) {
+        printf("Program not specified\n");
+        exit(1);
+    }
 
-  char* prog = argv[1];
-  int pid = fork();
-  if (!pid) {
-    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-    execl(prog, prog, NULL);
-  } else {
-    debugger dbg(prog, pid);
-    dbg.run();
-  }
+    char* prog = argv[1];
+    int pid = fork();
+    if (!pid) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        execl(prog, prog, NULL);
+    } else {
+        debugger dbg(prog, pid);
+        dbg.run();
+    }  
 }
